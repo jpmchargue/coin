@@ -5,7 +5,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives import serialization
 from cryptography.exceptions import InvalidSignature
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 
 import hashlib
 import json
@@ -16,6 +16,7 @@ import random
 
 import asyncio
 import aiohttp
+import uvicorn
 
 
 BOOTSTRAP_NODES = [
@@ -72,11 +73,12 @@ class Keys():
 
 
 class Outpoint():
-    def __init__(self, previous_tx_id, previous_tx_output_index, previous_tx_output_recipient, previous_tx_output_value):
-        self.previous_tx_id = previous_tx_id
-        self.previous_tx_output_index = previous_tx_output_index
-        self.previous_tx_output_recipient = previous_tx_output_recipient
-        self.previous_tx_output_value = previous_tx_output_value
+    def __init__(self, tx_id, tx_output_index, op_recipient, op_value):
+        self.previous_tx_id = tx_id
+        self.previous_tx_output_index = tx_output_index
+        self.previous_tx_output_recipient = op_recipient
+        self.previous_tx_output_value = op_value
+        self.spent = False
 
 class TxIn():
     def __init__(self, previous_tx_id, previous_tx_output_index, signature):
@@ -140,33 +142,11 @@ class Transaction():
         transaction.time = obj["time"]
         return transaction
 
-    def verify_transaction(transaction, blockchain):
-        # Transaction must not already exist
-        if blockchain.get_transaction(transaction.id) is not None:
-            return False
-        outpoints = [blockchain.get_outpoint(ti.previous_tx_id, ti.previous_tx_output_index) for ti in transaction.inputs]
-        total_input_value = 0
-        for i in range(len(transaction.inputs)):
-            ti = transaction.inputs[i]
-            op = outpoints[i]
-            # Transaction input signatures must be valid
-            input_is_valid = Keys.verify_signature(
-                str(ti.previous_tx_id) + str(ti.previous_tx_output_index),
-                ti.signature,
-                op.previous_tx_output_recipient
-            )
-            if not input_is_valid:
-                return False   
-            # Transaction inputs cannot be double spent
-            if blockchain.is_spent(op):
-                return False
-
-            total_input_value += op.previous_tx_output_value
-        # Total transaction input value must equal output value
-        total_output_value = sum([to.amount for to in transaction.outputs])
-        if total_input_value != total_output_value:
-            return False
-        return True
+    def involves_user(self, public_key):
+        for to in self.outputs:
+            if to.recipient == public_key:
+                return True
+        return False
 
 
 class Block():
@@ -185,10 +165,6 @@ class Block():
             transactions=block.transactions[:], 
             time=math.floor(time.time())
         )
-
-    def from_json(json):
-        # create a block from json
-        pass
 
     def to_obj(self):
         obj_transactions = [tx.to_obj() for tx in self.transactions]
@@ -215,6 +191,9 @@ class Block():
         )
         return block
 
+    def to_hash(self):
+        return hash(self.to_json())
+
     def add_transaction(self, transaction):
         self.transactions.append(transaction)
 
@@ -232,9 +211,32 @@ class Blockchain():
     def __init__(self):
         self.blocks = []
         self.current_block = None
+        
+        #self.block_lookup = {}
+        self.transaction_lookup = {}
+        self.outpoint_lookup = {}
+
+    def add_transaction(self, transaction):
+        """
+        Add a transaction to the current block.
+        """
+        # Add transactions to transaction lookup
+        self.transaction_lookup[transaction.id] = transaction
+
+        # Add outpoints to outpoint lookup
+        outpoints = [Outpoint(transaction.id, i, to.recipient, to.amount) for i, to in enumerate(transaction.outputs)]
+        self.outpoint_lookup[transaction.id] = outpoints
+
+        # Record when outpoints are spent
+        for ti in transaction.inputs:
+            if ti.previous_tx_id in self.outpoint_lookup \
+                    and ti.previous_tx_output_index < len(self.outpoint_lookup[ti.previous_tx_id]):
+                self.outpoint_lookup[ti.previous_tx_id][ti.previous_tx_outpoint_index].spent = True
 
     def add_block(self, block):
         self.blocks.append(block)
+        for tx in block.transactions:
+            self.add_transaction(tx)
 
     def to_obj(self):
         obj_blocks = [b.to_obj() for b in self.blocks]
@@ -248,9 +250,9 @@ class Blockchain():
 
     def from_obj(obj):
         blockchain = Blockchain()
-        blockchain.blocks = [Block.from_obj(block) for block in obj["blocks"]]
+        for block_obj in obj["blocks"]:
+            blockchain.add_block(Block.from_obj(block_obj))
         return blockchain
-
 
 
 class Node():
@@ -258,15 +260,6 @@ class Node():
         self.peers = BOOTSTRAP_NODES
         self.port = SERVER_PORT
         self.blockchain = Blockchain()
-
-    #def request(self, ip, json=None):
-    #    if json is None:
-            # GET request
-            #requests.get(ip, self.port)
-        
-
-    #def broadcast(self, content):
-    #    pass
 
     def bootstrap(self):
         # populate list of peers
@@ -295,7 +288,7 @@ class Node():
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for peer in self.peers:
-                    tasks.append(asyncio.ensure_future(session.get(peer + ':' + self.port + "/hello")))
+                    tasks.append(asyncio.ensure_future(session.get("http://" + peer + ':' + self.port + "/hello")))
             await asyncio.gather(*tasks)
 
         asyncio.run(broadcast())
@@ -308,7 +301,7 @@ class Node():
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for peer in self.peers:
-                    tasks.append(asyncio.ensure_future(session.post(peer + ':' + self.port + "/post/transaction", data=data)))
+                    tasks.append(asyncio.ensure_future(session.post("http://" + peer + ':' + self.port + "/post/transaction", data=data)))
             await asyncio.gather(*tasks)
 
         asyncio.run(broadcast())
@@ -321,7 +314,7 @@ class Node():
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for peer in self.peers:
-                    tasks.append(asyncio.ensure_future(session.post(peer + ':' + self.port + "/post/block", data=data)))
+                    tasks.append(asyncio.ensure_future(session.post("http://" + peer + ':' + self.port + "/post/block", data=data)))
             await asyncio.gather(*tasks)
 
         asyncio.run(broadcast())
@@ -334,61 +327,168 @@ class Node():
     def start_mining(self):
         pass
 
+    def verify_transaction(self, transaction):
+        # Transaction must not already exist
+        if transaction.id in self.blockchain.transaction_lookup:
+            return False
+        outpoints = [self.blockchain.outpoint_lookup[ti.previous_tx_id][ti.previous_tx_output_index] for ti in transaction.inputs]
+        total_input_value = 0
+        for i in range(len(transaction.inputs)):
+            ti = transaction.inputs[i]
+            op = outpoints[i]
+            # Transaction input signatures must be valid
+            input_is_valid = Keys.verify_signature(
+                str(ti.previous_tx_id) + str(ti.previous_tx_output_index),
+                ti.signature,
+                op.previous_tx_output_recipient
+            )
+            if not input_is_valid:
+                return False   
+            # Transaction inputs cannot be double spent
+            if op.spent:
+                return False
+
+            total_input_value += op.previous_tx_output_value
+        # Total transaction input value must equal output value
+        total_output_value = sum([to.amount for to in transaction.outputs])
+        if total_input_value != total_output_value:
+            return False
+        return True
+
+    def verify_block(self, block):
+        # Block index must be correct
+        if len(self.blockchain.blocks) == 0 and block.index != 0:
+            return False
+        elif block.index != self.blockchain.blocks[-1] + 1:
+            return False
+        
+        # Previous block hash must be correct
+        if block.previous_hash != self.blockchain.blocks[-1].to_hash():
+            return False
+
+        def transaction_is_reward(transaction):
+            if len(transaction.inputs) > 1:
+                return False
+            if transaction.inputs[0].signature != bytes(1):
+                return False
+            if len(transaction.outputs) > 1:
+                return False
+            if transaction.outputs[0].amount > 100:
+                return False
+            return True
+
+        # Verify all transactions in block
+        seen_mining_fee = False
+        for tx in block.transactions:
+            tx_is_valid = self.verify_transaction(tx)
+            if not tx_is_valid:
+                # A single 'invalid' transaction is allowed if this transaction is the mining reward
+                if seen_mining_fee:
+                    return False
+                elif transaction_is_reward(tx):
+                    seen_mining_fee = True
+                else:
+                    return False
+
+        return True
+
     def handle_transaction(self, transaction):
         # check if a transaction is valid, and add it if so
-        pass
+        if self.verify_transaction(transaction):
+            self.blockchain.add_transaction(transaction)
 
     def handle_block(self, block):
         # check if a block is valid, and add it if so
-        pass
+        if self.verify_block(block):
+            self.blockchain.add_block(block)
+            self.blockchain.current_block = Block()
+
+    def start_core(self):
+        print("Sending hello...")
+        self.send_hello()
+
+        print("Starting server...")
+        uvicorn.run("core:app", port=SERVER_PORT, log_level="info")
+
+        print("Beginning mining.")
+        self.mine()
 
     def mine(self):
         # start a background thread running this function as a process.
         # run a loop where a nonce is created and tested, and if its hash
         # has a certain number of zeros, broadcast it.
-        pass
+        while True:
+            candidate_nonce = random.randbytes(8)
+            difficulty = 2
+
+            # Create a copy of the current block to avoid a race condition
+            candidate_block = Block.from_copy(self.blockchain.current_block)
+            candidate_block.time = math.floor(time.time())
+            hash_string = candidate_block.check_nonce(candidate_nonce).hex()
+            if hash_string.ends_with("0" * difficulty):
+                # You mined the block!
+                candidate_block.nonce = candidate_nonce
+                self.send_block(candidate_block)
+                self.blockchain.add_block(candidate_block)
+                self.blockchain.current_block = Block(
+                        self.blockchain.blocks[-1].index + 1,
+                        self.blockchain.blocks[-1].to_hash()
+                )
 
 
 app = FastAPI()
 node = Node()
 node.bootstrap()
+node.start_core()
 
 @app.get("/hello")
-def hello():
+def hello(request: Request):
     """
     Add the requesting IP to this server's list of peers.
     """
-    pass
+    node.peers.append(request.client.host)
+    return {"response": 1}
 
 @app.get("/peers")
 def get_peers():
-    pass
+    return json.dumps(node.peers)
 
 @app.get("/blockchain")
 def get_blockchain():
     """
     Return a copy of the entire blockchain, according to this node.
     """
-    return "<p>Hello, World!</p>"
+    return node.blockchain.to_json()
 
 @app.get("/block")
 def get_current_block():
-    pass
+    return node.blockchain.current_block.to_json()
 
 @app.post("/post/block")
 def receive_block(data):
-    pass
+    block_json = json.loads(data)
+    block = Block.from_obj(block_json)
+    node.handle_block(Blockchain.from_obj(block))
 
 @app.post("/post/transaction")
 def receive_transaction(data):
-    pass
+    tx_json = json.loads(data)
+    tx = Transaction.from_obj(tx_json)
+    node.handle_transaction(tx)
 
 @app.get("/user/{user}")
 def get_user(user: str):
-    # get all transactions associated with a user, using their public key
-    pass
+    # get all confirmed transactions associated with a user, using their public key
+    user_transactions = []
+    for block in node.blockchain.blocks:
+        for tx in block.transactions:
+            if tx.involves_user(user):
+                user_transactions.append(tx.to_obj())
+    return json.dumps(user_transactions)
 
-@app.get("/transaction/{id}")
-def get_transaction(id: str):
+@app.get("/transaction/{hex}")
+def get_transaction(hex: str):
     # use transaction hash?
-    pass
+    tx_id = bytes.fromhex(hex)
+    tx = node.blockchain.transaction_lookup[tx_id]
+    return tx.to_json()
