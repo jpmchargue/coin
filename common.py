@@ -31,14 +31,14 @@ def hash(data):
     return hash_algorithm.digest()
 
 class Keys():
-    pem_header = b'-----BEGIN ENCRYPTED PRIVATE KEY-----\n'
-    pem_footer = b'-----END ENCRYPTED PRIVATE KEY-----\n'
+    pem_header = b"-----BEGIN PUBLIC KEY-----\n"
+    pem_footer = b"\n-----END PUBLIC KEY-----\n"
     def __init__(self, private_key):
         self.private_key = private_key
     def generate_new_pair():
         private_key = rsa.generate_private_key(
             public_exponent=65537,
-            key_size=4096,
+            key_size=1024,
             backend=default_backend()
         )
         return Keys(private_key)
@@ -51,26 +51,31 @@ class Keys():
             ),
             hashes.SHA256()
         )
-    def readable_key(self):
-        return self.private_key.private_bytes(
+    def make_readable_key(self, save_as):
+        key = self.private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
             encryption_algorithm=serialization.NoEncryption()
-        )#[38:-36]
-    def from_readable_key(readable_key):
-        private_key = serialization.load_pem_private_key(
-            #Keys.pem_header + readable_key + Keys.pem_footer,
-            readable_key,
-            password=None,
         )
-        return Keys(private_key)
+        with open(save_as, 'wb') as file:
+            file.write(key)
+    def from_readable_key(readable_key):
+        with open(readable_key, 'rb') as file:
+            private_key = serialization.load_pem_private_key(
+                file.read(),
+                password=None,
+            )
+            return Keys(private_key)
     def public_key(self):
         return self.private_key.public_key().public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
-        )[38:-36]
+        )[27:-26]
     def verify_signature(string, signature, public_key):
-        public_key_obj = serialization.load_pem_public_key(Keys.pem_header + public_key + Keys.pem_footer)
+        key_data = Keys.pem_header + public_key + Keys.pem_footer
+        print(key_data)
+        print(signature)
+        public_key_obj = serialization.load_pem_public_key(key_data)
         try:
             public_key_obj.verify(
                 signature,
@@ -114,7 +119,11 @@ class Transaction():
         self.time = math.floor(time.time())
 
     def create(keys, previous_tx_id, previous_tx_output_index, previous_tx_value, recipient, amount):
-        signature = keys.sign(str(previous_tx_id) + str(previous_tx_output_index))
+        print("signing " + str(previous_tx_id.hex()) + str(previous_tx_output_index))
+        signature = keys.sign(str(previous_tx_id.hex()) + str(previous_tx_output_index))
+        print(signature)
+        print(Keys.verify_signature(str(previous_tx_id.hex()) + str(previous_tx_output_index), signature, keys.public_key()))
+        input()
         inputs = [TxIn(previous_tx_id, previous_tx_output_index, signature)]
         outputs = [TxOut(amount, recipient), TxOut(previous_tx_value - amount, keys.public_key())]
         return Transaction(inputs, outputs)
@@ -150,22 +159,26 @@ class Transaction():
         return json.dumps(self.to_obj())
 
     def from_obj(obj):
-        inputs = [TxIn(ti["tx_id"], ti["tx_output_index"], ti["signature"]) for ti in obj["inputs"]]
-        outputs = [TxOut(to["amount"], to["recipient"]) for to in obj["outputs"]]
+        inputs = [TxIn(bytes.fromhex(ti["tx_id"]), ti["tx_output_index"], bytes.fromhex(ti["signature"])) for ti in obj["inputs"]]
+        outputs = [TxOut(to["amount"], bytes.fromhex(to["recipient"])) for to in obj["outputs"]]
         transaction = Transaction(inputs, outputs)
-        transaction.id = obj["id"]
+        transaction.id = bytes.fromhex(obj["id"])
         transaction.time = obj["time"]
         return transaction
 
-    def involves_user(self, public_key):
-        for to in self.outputs:
-            if to.recipient == public_key:
-                return True
-        return False
+    def get_user_outpoint(self, public_key):
+        for index, to in enumerate(self.outputs):
+            if to.recipient.hex() == public_key:
+                return {
+                    "tx_id": self.id.hex(),
+                    "tx_output_index": index,
+                    "amount": to.amount
+                }
+        return None
 
 
 class Block():
-    def __init__(self, index, previous_hash, nonce=0, transactions=[], time=0):
+    def __init__(self, index, previous_hash, nonce=bytes(1), transactions=[], time=0):
         self.index = index # int
         self.previous_hash = previous_hash # bytes
         self.nonce = nonce # bytes
@@ -198,11 +211,11 @@ class Block():
     def from_obj(obj):
         transactions = [Transaction.from_obj(tx) for tx in obj["transactions"]]
         block = Block(
-            block["index"], 
-            bytes.fromhex(block["previous_hash"]),
+            obj["index"], 
+            bytes.fromhex(obj["previous_hash"]),
             bytes.fromhex(obj["nonce"]),
             transactions,
-            block["time"]
+            obj["time"]
         )
         return block
 
@@ -243,7 +256,9 @@ class Blockchain():
         for ti in transaction.inputs:
             if ti.previous_tx_id in self.outpoint_lookup \
                     and ti.previous_tx_output_index < len(self.outpoint_lookup[ti.previous_tx_id]):
-                self.outpoint_lookup[ti.previous_tx_id][ti.previous_tx_outpoint_index].spent = True
+                self.outpoint_lookup[ti.previous_tx_id][ti.previous_tx_output_index].spent = True
+
+        self.current_block.transactions.append(transaction)
 
     def add_block(self, block):
         self.blocks.append(block)
@@ -273,6 +288,7 @@ class Node():
         self.port = SERVER_PORT
         self.blockchain = Blockchain()
         self.keys = None
+        self.key_path = ""
 
     def bootstrap(self):
         # populate list of peers
@@ -280,48 +296,68 @@ class Node():
             print("it has peers!")
             url = "http://" + random.choice(self.peers) + ":" + str(self.port) + "/peers"
             print(f"Fetching from {url}")
-            peers_json = requests.get(url).text
-            print(peers_json)
-            if len(peers_json) > 0:
-                self.peers = json.loads(peers_json)
+            peers_obj = json.loads(requests.get(url).json())
+            for peer in peers_obj["peers"]:
+                if peer not in self.peers:
+                    self.peers.append(peer)
 
     def update_peers(self):
         if len(self.peers) > 0:
             url = "http://" + random.choice(self.peers) + ":" + str(self.port) + "/peers"
             print(f"Fetching from {url}")
-            peers_json = requests.get(url)
-            self.peers = json.loads(peers_json)
+            peers_json = requests.get(url).json()
+            peers_obj = json.loads(peers_json)
+            for peer in peers_obj["peers"]:
+                if peer not in self.peers:
+                    self.peers.append(peer)
 
     def request_user_data(self, user_id):
         if len(self.peers) > 0:
             url = "http://" + random.choice(self.peers) + ":" + str(self.port) + "/user/" + user_id
             print(f"Fetching from {url}")
-            user_json = requests.get(url)
-            return user_json
+            user_json = requests.get(url).json()
+            return json.loads(user_json)
 
     def request_transaction_data(self, tx_id):
         if len(self.peers) > 0:
             url = "http://" + random.choice(self.peers) + ":" + str(self.port) + "/transaction/" + tx_id
             print(f"Fetching from {url}")
-            tx_json = requests.get(url)
+            tx_json = requests.get(url).json()
             return tx_json
 
     def request_blockchain(self):
         if len(self.peers) > 0:
             url = "http://" + random.choice(self.peers) + ":" + str(self.port) + "/blockchain"
             print(f"Fetching from {url}")
-            blockchain_json = requests.get(url)
+            blockchain_json = requests.get(url).json()
             self.blockchain = Blockchain.from_obj(json.loads(blockchain_json))
+            return blockchain_json
 
-    def new_user(self):
+    def new_user(self, save_as):
         self.keys = Keys.generate_new_pair()
-        return self.keys.readable_key()
+        self.keys.make_readable_key(save_as)
+        self.key_path = save_as
+        return save_as
 
     def set_user(self, private_key):
         self.keys = Keys.from_readable_key(private_key)
+        self.key_path = private_key
 
     def create_transaction(self, tx, tx_output_index, recipient, amount):
-        transaction = Transaction.create(self.keys, tx, tx_output_index, recipient, amount)
+        print("Checking login...")
+        if self.keys is None:
+            print("transaction failed: no user is logged in to send from")
+            return None 
+        
+        print("Fetching outpoint data...")
+        transaction = json.loads(self.request_transaction_data(tx))
+        outpoint = transaction["outputs"][tx_output_index]
+
+        print("Validating user...")
+        if outpoint["recipient"] != self.keys.public_key().hex():
+            print("send failed: outpoint doesn't belong to the current user")
+
+        transaction = Transaction.create(self.keys, bytes.fromhex(tx), tx_output_index, outpoint["amount"], bytes.fromhex(recipient), amount)
         return transaction
 
     def send_hello(self):
@@ -331,22 +367,28 @@ class Node():
                 tasks = []
                 for peer in self.peers:
                     tasks.append(asyncio.ensure_future(session.get("http://" + peer + ':' + self.port + "/hello")))
-            await asyncio.gather(*tasks)
+                await asyncio.gather(*tasks)
 
-        asyncio.to_thread(broadcast())
+        asyncio.run(broadcast())
 
     def send_transaction(self, transaction):
         # use broadcast
         data = transaction.to_json()
+        print("got here 1")
 
         async def broadcast():
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for peer in self.peers:
-                    tasks.append(asyncio.ensure_future(session.post("http://" + peer + ':' + self.port + "/post/transaction", data=data)))
-            await asyncio.gather(*tasks)
+                    url = "http://" + peer + ':' + str(self.port) + "/post/transaction"
+                    print(f"sending to {url}")
+                    #session.post(url)
+                    tasks.append(asyncio.ensure_future(session.post(url, data=data)))
+                    #print("sending")
+                await asyncio.gather(*tasks)
 
-        asyncio.to_thread(broadcast())
+        print("got here 2")
+        asyncio.run(broadcast())
         
     def send_block(self, block):
         # use broadcast
@@ -356,14 +398,15 @@ class Node():
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for peer in self.peers:
-                    tasks.append(asyncio.ensure_future(session.post("http://" + peer + ':' + self.port + "/post/block", data=data)))
-            await asyncio.gather(*tasks)
+                    tasks.append(asyncio.ensure_future(session.post("http://" + peer + ':' + self.port + "/post/block", json=data)))
+                await asyncio.gather(*tasks)
 
-        asyncio.to_thread(broadcast())
+        asyncio.run(broadcast())
 
     def verify_transaction(self, transaction):
         # Transaction must not already exist
         if transaction.id in self.blockchain.transaction_lookup:
+            print("transaction ID already exists")
             return False
         outpoints = [self.blockchain.outpoint_lookup[ti.previous_tx_id][ti.previous_tx_output_index] for ti in transaction.inputs]
         total_input_value = 0
@@ -371,22 +414,28 @@ class Node():
             ti = transaction.inputs[i]
             op = outpoints[i]
             # Transaction input signatures must be valid
+            print("Checking " + ti.previous_tx_id.hex() + str(ti.previous_tx_output_index))
             input_is_valid = Keys.verify_signature(
-                str(ti.previous_tx_id) + str(ti.previous_tx_output_index),
+                ti.previous_tx_id.hex() + str(ti.previous_tx_output_index),
                 ti.signature,
                 op.previous_tx_output_recipient
             )
             if not input_is_valid:
+                print("signature not accepted")
                 return False   
             # Transaction inputs cannot be double spent
             if op.spent:
+                print("transaction was already spent")
                 return False
 
             total_input_value += op.previous_tx_output_value
         # Total transaction input value must equal output value
         total_output_value = sum([to.amount for to in transaction.outputs])
         if total_input_value != total_output_value:
+            print("input value must equal output value")
             return False
+        
+        print("transaction accepted")
         return True
 
     def verify_block(self, block):
@@ -441,7 +490,7 @@ class Node():
         block_index = len(self.blockchain.blocks)
         block_hash = self.blockchain.blocks[-1].to_hash() if block_index > 0 else bytes(32)
         mining_reward = Transaction.create(self.keys, bytes(64), 0, MINING_REWARD, self.keys.public_key(), MINING_REWARD)
-        block = Block(block_index, block_hash)
+        block = Block(block_index, block_hash, transactions=[])
         block.transactions.append(mining_reward)
         return block
 
@@ -474,7 +523,7 @@ class Node():
             candidate_block.time = math.floor(time.time())
             hash_string = candidate_block.to_hash(check_nonce=candidate_nonce).hex()
 
-            print(f"Got hash {hash_string}")
+            #print(f"Got hash {hash_string}")
 
             if hash_string.endswith("0" * difficulty):
                 # You mined the block!
@@ -485,12 +534,7 @@ class Node():
                 print(f"New Block Hash: {hash_string}")
 
                 self.blockchain.add_block(candidate_block)
-                print("Blockchain:")
-                print(self.blockchain.to_json())
-                input()
 
                 self.send_block(candidate_block)
-                self.blockchain.current_block = Block(
-                        self.blockchain.blocks[-1].index + 1,
-                        self.blockchain.blocks[-1].to_hash()
-                )
+                new_block = self.initialize_block()
+                self.blockchain.current_block = new_block

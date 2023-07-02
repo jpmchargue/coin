@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Request
 from common import Transaction, Block, Blockchain, Node
 import json
+from threading import Thread
 
 node = Node()
 
@@ -15,7 +16,7 @@ def hello(request: Request):
 
 @app.get("/peers")
 def get_peers():
-    return json.dumps(node.peers)
+    return json.dumps({"peers": node.peers})
 
 @app.get("/blockchain")
 def get_blockchain():
@@ -34,8 +35,27 @@ def receive_block(data):
     block = Block.from_obj(block_json)
     node.handle_block(Blockchain.from_obj(block))
 
+from pydantic import BaseModel
+from typing import List
+class JSONTransactionInput(BaseModel):
+    tx_id: str
+    tx_output_index: int
+    signature: str
+
+class JSONTransactionOutput(BaseModel):
+    amount: int
+    recipient: str
+
+class JSONTransaction(BaseModel):
+    id: str
+    inputs: List[JSONTransactionInput]
+    outputs: List[JSONTransactionOutput]
+    time: int
+
 @app.post("/post/transaction")
-def receive_transaction(data):
+async def receive_transaction(request: Request):
+    #print(data)
+    data = await request.body()
     tx_json = json.loads(data)
     tx = Transaction.from_obj(tx_json)
     node.handle_transaction(tx)
@@ -46,8 +66,14 @@ def get_user(user: str):
     user_transactions = []
     for block in node.blockchain.blocks:
         for tx in block.transactions:
-            if tx.involves_user(user):
-                user_transactions.append(tx.to_obj())
+            outpoint = tx.get_user_outpoint(user)
+            if outpoint is not None:
+                print("found transaction")
+                # This user either gained or lost money in this transaction
+                print(outpoint["tx_id"])
+                print(outpoint["tx_output_index"])
+                outpoint["spent"] = node.blockchain.outpoint_lookup[bytes.fromhex(outpoint["tx_id"])][outpoint["tx_output_index"]].spent
+                user_transactions.append(outpoint)
     return json.dumps(user_transactions)
 
 @app.get("/transaction/{hex}")
@@ -62,11 +88,12 @@ node.bootstrap()
 
 print("Enter the private key of the user to mine as.")
 print("If nothing is entered, a new user will be created.")
-private_key = input()
-if len(private_key) == 0:
-    private_key = node.new_user()
-    print("A new user was created with the following private key:")
-    print(private_key)
-node.set_user(private_key)
+private_key_location = input()
+if len(private_key_location) == 0:
+    private_key_location = node.new_user("key.txt")
+    print("A new user was created. The key has been saved to 'key.txt'.")
+    input()
+node.set_user(private_key_location)
 
-node.start_core()
+mining_thread = Thread(target=node.start_core)
+mining_thread.start()
