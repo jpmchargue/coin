@@ -73,8 +73,6 @@ class Keys():
         )[27:-26]
     def verify_signature(string, signature, public_key):
         key_data = Keys.pem_header + public_key + Keys.pem_footer
-        print(key_data)
-        print(signature)
         public_key_obj = serialization.load_pem_public_key(key_data)
         try:
             public_key_obj.verify(
@@ -119,11 +117,10 @@ class Transaction():
         self.time = math.floor(time.time())
 
     def create(keys, previous_tx_id, previous_tx_output_index, previous_tx_value, recipient, amount):
-        print("signing " + str(previous_tx_id.hex()) + str(previous_tx_output_index))
+        #print("signing " + str(previous_tx_id.hex()) + str(previous_tx_output_index))
         signature = keys.sign(str(previous_tx_id.hex()) + str(previous_tx_output_index))
-        print(signature)
-        print(Keys.verify_signature(str(previous_tx_id.hex()) + str(previous_tx_output_index), signature, keys.public_key()))
-        input()
+        #print(signature)
+        #print(Keys.verify_signature(str(previous_tx_id.hex()) + str(previous_tx_output_index), signature, keys.public_key()))
         inputs = [TxIn(previous_tx_id, previous_tx_output_index, signature)]
         outputs = [TxOut(amount, recipient), TxOut(previous_tx_value - amount, keys.public_key())]
         return Transaction(inputs, outputs)
@@ -258,8 +255,6 @@ class Blockchain():
                     and ti.previous_tx_output_index < len(self.outpoint_lookup[ti.previous_tx_id]):
                 self.outpoint_lookup[ti.previous_tx_id][ti.previous_tx_output_index].spent = True
 
-        self.current_block.transactions.append(transaction)
-
     def add_block(self, block):
         self.blocks.append(block)
         for tx in block.transactions:
@@ -366,7 +361,7 @@ class Node():
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for peer in self.peers:
-                    tasks.append(asyncio.ensure_future(session.get("http://" + peer + ':' + self.port + "/hello")))
+                    tasks.append(asyncio.ensure_future(session.get("http://" + peer + ':' + str(self.port) + "/hello")))
                 await asyncio.gather(*tasks)
 
         asyncio.run(broadcast())
@@ -374,7 +369,6 @@ class Node():
     def send_transaction(self, transaction):
         # use broadcast
         data = transaction.to_json()
-        print("got here 1")
 
         async def broadcast():
             async with aiohttp.ClientSession() as session:
@@ -387,7 +381,6 @@ class Node():
                     #print("sending")
                 await asyncio.gather(*tasks)
 
-        print("got here 2")
         asyncio.run(broadcast())
         
     def send_block(self, block):
@@ -398,7 +391,8 @@ class Node():
             async with aiohttp.ClientSession() as session:
                 tasks = []
                 for peer in self.peers:
-                    tasks.append(asyncio.ensure_future(session.post("http://" + peer + ':' + self.port + "/post/block", json=data)))
+                    url = "http://" + peer + ':' + str(self.port) + "/post/block"
+                    tasks.append(asyncio.ensure_future(session.post(url, data=data)))
                 await asyncio.gather(*tasks)
 
         asyncio.run(broadcast())
@@ -441,12 +435,15 @@ class Node():
     def verify_block(self, block):
         # Block index must be correct
         if len(self.blockchain.blocks) == 0 and block.index != 0:
+            print("block index is incorrect")
             return False
-        elif block.index != self.blockchain.blocks[-1] + 1:
+        elif block.index != self.blockchain.blocks[-1].index + 1:
+            print("block index is incorrect")
             return False
         
         # Previous block hash must be correct
         if block.previous_hash != self.blockchain.blocks[-1].to_hash():
+            print("previous block hash is incorrect")
             return False
 
         def transaction_is_reward(transaction):
@@ -467,10 +464,12 @@ class Node():
             if not tx_is_valid:
                 # A single 'invalid' transaction is allowed if this transaction is the mining reward
                 if seen_mining_fee:
+                    print("block rejected due to invalid transaction")
                     return False
                 elif transaction_is_reward(tx):
                     seen_mining_fee = True
                 else:
+                    print("block rejected due to invalid transaction")
                     return False
 
         return True
@@ -478,13 +477,13 @@ class Node():
     def handle_transaction(self, transaction):
         # check if a transaction is valid, and add it if so
         if self.verify_transaction(transaction):
-            self.blockchain.add_transaction(transaction)
+            self.blockchain.current_block.add_transaction(transaction)
 
     def handle_block(self, block):
         # check if a block is valid, and add it if so
         if self.verify_block(block):
             self.blockchain.add_block(block)
-            self.blockchain.current_block = Block()
+            self.blockchain.current_block = self.initialize_block()
 
     def initialize_block(self):
         block_index = len(self.blockchain.blocks)
@@ -499,7 +498,7 @@ class Node():
         self.request_blockchain()
 
         print("Got blockchain:")
-        print(self.blockchain.to_obj)
+        print(self.blockchain.to_json())
 
         print("Sending hello...")
         self.send_hello()
@@ -507,7 +506,7 @@ class Node():
         print("Initializing block...")
         self.blockchain.current_block = self.initialize_block()
 
-        print("Beginning mining.")
+        print("Mining...")
         self.mine()
 
     def mine(self):
@@ -538,3 +537,5 @@ class Node():
                 self.send_block(candidate_block)
                 new_block = self.initialize_block()
                 self.blockchain.current_block = new_block
+
+                print("Saved block, returning to mining...")

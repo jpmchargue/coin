@@ -11,7 +11,8 @@ def hello(request: Request):
     """
     Add the requesting IP to this server's list of peers.
     """
-    node.peers.append(request.client.host)
+    if request.client.host not in node.peers:
+        node.peers.append(request.client.host)
     return {"response": 1}
 
 @app.get("/peers")
@@ -30,10 +31,11 @@ def get_current_block():
     return node.blockchain.current_block.to_json()
 
 @app.post("/post/block")
-def receive_block(data):
+async def receive_block(request: Request):
+    data = await request.body()
     block_json = json.loads(data)
     block = Block.from_obj(block_json)
-    node.handle_block(Blockchain.from_obj(block))
+    node.handle_block(block)
 
 from pydantic import BaseModel
 from typing import List
@@ -55,6 +57,7 @@ class JSONTransaction(BaseModel):
 @app.post("/post/transaction")
 async def receive_transaction(request: Request):
     #print(data)
+    print("ba-bing")
     data = await request.body()
     tx_json = json.loads(data)
     tx = Transaction.from_obj(tx_json)
