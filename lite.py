@@ -4,7 +4,7 @@ from common import Node
 node = Node()
 node.bootstrap()
 
-title = "----- ShitCoin Lite -----"
+title = "----- Coin Lite -----"
 greeting = """*--------------------------------*
 | commands
 | newuser - create a new user
@@ -21,7 +21,7 @@ greeting = """*--------------------------------*
 |    the coins from the output from the given transaction/output index.
 |
 | help - show this again
-| exit - quit ShitCoin lite
+| exit - quit Coin Lite
 *---------------------------------*"""
 
 print(title)

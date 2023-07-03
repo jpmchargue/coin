@@ -1,0 +1,5 @@
+requests==2.27.1
+asyncio==3.4.3
+aiohttp==3.8.1
+uvicorn==0.22.0
+fastapi==0.97.0
